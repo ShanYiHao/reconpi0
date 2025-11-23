@@ -1,0 +1,24 @@
+# 忽略 Python 缓存
+__pycache__/
+*.py[cod]
+
+# 忽略环境配置
+.env
+.venv
+venv/
+ENV/
+
+# 忽略 IDE 配置
+.vscode/
+.idea/
+
+# 关键：忽略大文件和数据集
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+data/
+outputs/
+checkpoints/
+wandb/
