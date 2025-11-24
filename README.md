@@ -1,165 +1,125 @@
-# Pi0-Recon-VLA: 基于辅助重建任务的 Pi0 高效微调框架
+# Reconpi-VLA: 基于辅助重建任务的 Pi0 高效微调框架
 
-本仓库实现了一个针对 **$\pi_0$ (Pi0)** VLA 模型的轻量级微调框架。通过引入 **ReconVLA** (Reconstruction for Vision-Language-Action) 思想，在原有动作生成任务的基础上，增加了一个基于 DiT 的视觉重建辅助任务，利用 **LoRA (PEFT)** 技术实现低显存下的联合训练。
+## 1\. 项目概述与工作内容 (Project Summary)
 
------
+本项目基于 **Physical Intelligence $\pi_0$ (PyTorch版)** 模型架构，融合了 **ReconVLA** 的辅助重建思想，构建了一套支持联合训练（Joint Training）的轻量级微调框架。
 
-## 1\. 科研工作与架构设计 (Research Methodology)
+**主要工作内容包括：**
 
-本项目旨在解决 Pi0 模型在下游任务微调中物理表征能力不足的问题。核心工作内容如下：
-
-### 1.1 架构创新：双流联合训练 (Joint Training)
-
-不同于原版 Pi0 仅依赖 Action Loss，本项目构建了一个 **Action-Recon 双流架构**：
-
-  - **主干网络 (Backbone)**: 使用预训练的 PaliGemma (SigLIP + Gemma) 提取多模态特征。
-  - **动作流 (Action Path)**: 特征流向原有的 Action Expert (Flow Matching) 生成动作。
-  - **重建流 (Recon Path)**: **[核心工作]** 在 VLM 输出端截获 `visual_features` 和 `text_embeds`，输入到新增的 **ReconDenoiser (DiT)** 模块中，执行基于文本条件的图像重建任务。
-  - **Loss 融合**: $L_{total} = L_{action} + \lambda \cdot L_{recon}$。通过重建 Loss 的梯度回传，迫使 VLM 学习更鲁棒的物理规律。
-
-### 1.2 工程优化：LoRA 高效微调
-
-鉴于全量微调的高显存需求，本项目采用了 **PEFT (Parameter-Efficient Fine-Tuning)** 策略：
-
-  - **冻结 (Freeze)**: 冻结 Vision Encoder 和 LLM 的大部分参数。
-  - **注入 (Inject)**: 在 Attention 层 (`q_proj`, `v_proj` 等) 注入秩为 $r=16$ 的 LoRA 适配器。
-  - **全参训练**: 新增的 Recon Head (DiT) 保持全参数训练状态。
-
-### 1.3 白盒化改造 (White-box Modification)
-
-为了实现特征截获，对 OpenPI 源码进行了必要的**侵入式修改**：
-
-  - 重写了 `pi0_pytorch.py` 的 `forward` 函数，使其支持输出中间层视觉特征。
-  - 解决了 OpenPI 硬编码维度 (32-dim) 的问题，改为动态适配 `action_dim`。
-  - 修复了多视角 (Multi-view) 数据在 DiT 输入时的维度广播问题。
+1.  **架构缝合**：将 ReconVLA 中的 DiT（Diffusion Transformer）去噪头成功移植并集成到 Pi0 的 VLM 主干之后。
+2.  **白盒化改造**：对 OpenPI 的源码进行了侵入式修改，打破了原有的封装，实现了中间层视觉特征（Visual Features）和文本特征（Text Embeddings）的截获与流转。
+3.  **LoRA 高效微调**：使用 `peft` 库实现了 Parameter-Efficient Fine-Tuning，在冻结 2B+ 参数模型主干的同时，仅通过训练 Adapter 和 Recon Head 实现多任务优化。
+4.  **多视角适配**：解决了 VLM 序列化输出与 DiT 图像化输入之间的维度冲突，支持 Aloha 等多摄像头机器人数据的并行处理。
+5.  **环境解耦**：解决了 OpenPI 复杂的 JAX/Flax 依赖问题，实现了在纯 PyTorch 环境下的运行，并处理了 `transformers` 库的底层兼容性补丁。
 
 -----
 
-## 2\. 环境安装与配置 (Installation)
+## 2\. 核心修改策略与数据流向 (Architecture & Data Flow)
 
-本项目对 `transformers` 库有特定版本依赖及补丁要求，请严格按照以下步骤操作。
+### 2.1 整体架构逻辑
 
-### 2.1 基础环境
+项目采用了 **"Backbone + Dual Heads"** 的设计模式：
 
-推荐使用 Linux 服务器环境 (CUDA 12.x)。
+  * **Backbone**: PaliGemma (SigLIP Vision Encoder + Gemma LLM)，负责提取多模态特征。
+  * **Head A (Action)**: 原有的 Flow Matching Action Expert，负责生成机器人动作。
+  * **Head B (Recon)**: 新增的 ReconDenoiser (DiT)，负责根据文本条件重建视觉特征。
+
+### 2.2 关键数据流向修改 (Data Flow Modification)
+
+这是本项目最核心的技术难点，主要体现在 `src/wrapper.py` 和 `src/pi0_core/pi0_pytorch.py` 中：
+
+1.  **特征截获 (Feature Interception)**:
+
+      * 修改了 `pi0_pytorch.py` 的 `forward` 函数。
+      * 原逻辑仅返回 Loss，现逻辑返回字典：`{'loss': action_loss, 'visual_features': [B, N, D], 'text_embeds': [B, L, D]}`。
+      * **目的**：让 Recon 分支能够获取到 Backbone 提取的高维特征，且**不阻断梯度回传**（No Detach），从而利用重建任务优化 Backbone 的表征能力。
+
+2.  **维度重塑与对齐 (Reshape & Alignment)**:
+
+      * **视觉特征**：Pi0 输出的是序列化特征 `[B, Total_Tokens, Dim]`（包含多视角拼接）。
+          * *修改*：在 Wrapper 中将其重排为 `[B*Cams, Dim, H, W]`，以适配 DiT 对图像空间结构的输入要求。
+      * **文本特征**：Pi0 输出的是序列 `[B, SeqLen, Dim]`。
+          * *修改*：由于 DiT 使用 AdaLN 接收全局条件，我们对文本特征进行了 Pooling（平均池化），并扩展为 `[B*Cams, Dim, 1, 1]` 以进行广播。
+
+3.  **Loss 融合 (Joint Optimization)**:
+
+      * 最终 Loss 计算公式：$L_{total} = L_{action} + 0.5 \times L_{recon}$。
+
+### 2.3 PEFT/LoRA 微调策略
+
+为了在有限显存下训练大模型，我们并未全量更新参数，而是制定了精细的梯度更新策略：
+
+  * **LoRA 配置 (`scripts/train.py`)**:
+      * **Target Modules**: `["q_proj", "v_proj", "k_proj", "o_proj"]` (针对 Gemma 的 Attention 层)。
+      * **Rank**: 16, **Alpha**: 32。
+  * **参数冻结状态**:
+      * 🟢 **训练**: LoRA Adapters, Recon Head (DiT, 全参)。
+      * 🔒 **冻结**: SigLIP Vision Encoder, Gemma Backbone (除 LoRA 外), Action Head (可选冻结或微调)。
+
+-----
+
+## 3\. 仓库结构说明
+
+```text
+reconPI/
+├── configs/                # 配置文件
+├── scripts/
+│   └── train.py            # 🚀 训练入口 (包含 LoRA 注入和 Optimizer 定义)
+├── src/
+│   ├── dataset.py          # 数据加载器 (需根据真实数据修改)
+│   ├── wrapper.py          # 🧩 核心胶水层：处理多视角维度变换、Loss融合
+│   ├── pi0_core/           # 🤖 魔改后的 Pi0 源码 (含动态维度、特征提取修改)
+│   │   ├── pi0_pytorch.py  # 重点修改文件
+│   │   └── ...
+│   └── recon_core/         # 👁️ 移植的 ReconVLA 模块
+├── debug_model.py          # ✅ 冒烟测试脚本 (用于验证架构连通性)
+└── setup_env.sh            # 🛠️ 环境配置与补丁脚本
+```
+
+-----
+
+## 4\. 服务器集成与训练指南 (For Integration)
+
+### 4.1 环境部署
+
+在服务器上，必须运行以下脚本以应用 OpenPI 对 `transformers` 库的底层修改：
 
 ```bash
-# 1. 创建环境
+# 1. 创建并激活环境
 conda create -n pi0_recon python=3.11
 conda activate pi0_recon
 
-# 2. 安装 PyTorch (根据服务器 CUDA 版本调整)
-pip install torch torchvision torchaudio
-
-# 3. 安装项目依赖
-pip install transformers==4.53.2 peft accelerate timm einops tqdm blobfile numpy pytest beartype jaxtyping jax jaxlib ml_collections wandb
-```
-
-### 2.2 应用 OpenPI 补丁 (关键步骤)
-
-由于 OpenPI 修改了 SigLIP/PaliGemma 的底层实现，必须手动覆盖 `transformers` 库的源码。
-
-**方法 A：使用一键脚本 (推荐)**
-
-```bash
+# 2. 运行一键配置脚本 (安装依赖 + 覆盖 transformers 源码)
 bash setup_env.sh
 ```
 
-**方法 B：手动覆盖**
+### 4.2 数据集放置与接入
 
-```bash
-# 找到 transformers 安装路径
-SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-# 覆盖文件
-cp -r src/pi0_core/transformers_replace/models/* "$SITE_PACKAGES/transformers/models/"
-```
+目前 `src/dataset.py` 使用的是 Mock 数据。接入真实数据请遵循以下规范：
 
------
+1.  **数据格式**：推荐使用 LeRobot 标准或 Aloha HDF5 格式。
+2.  **修改 `src/dataset.py`**:
+      * **图像键名**：必须包含 `['base_0_rgb', 'left_wrist_0_rgb', 'right_wrist_0_rgb']`（与 OpenPI 预处理逻辑对齐）。
+      * **预处理**：必须包含 `Resize(224)` 和 `Normalize(mean=0.5, std=0.5)`。
+      * **文本**：使用 `google/paligemma-3b-pt-224` 的 Tokenizer 处理指令。
 
-## 3\. 项目结构说明 (Project Structure)
+### 4.3 恢复“完全体”模型 (从 Dummy 切换到 Real)
 
-```text
-pi0-recon-finetune/
-├── configs/                # 存放训练配置文件
-├── scripts/
-│   └── train.py            # 🚀 [核心] 训练入口脚本 (集成 LoRA 与 Optimizer)
-├── src/
-│   ├── dataset.py          # 📋 [需修改] 数据加载器 (目前为 Mock 数据)
-│   ├── wrapper.py          # 🧩 [核心] Pi0ReconWrapper，缝合 Pi0 与 Recon 模块
-│   ├── pi0_core/           # 🤖 [已魔改] Pi0 模型定义 (请勿随意替换)
-│   │   ├── pi0_pytorch.py  # 修改了 forward 以返回特征
-│   │   └── ...
-│   └── recon_core/         # 👁️ [移植] ReconVLA 的 DiT 去噪模块
-│       └── denoiser_dit.py
-├── debug_model.py          # ✅ 冒烟测试脚本 (用于验证架构连通性)
-└── setup_env.sh            # 环境配置脚本
-```
+本地调试时使用了 `dummy` 模式。在服务器正式训练前，需修改以下文件：
 
------
+1.  **修改 `scripts/train.py`**:
 
-## 4\. 快速上手 (Quick Start)
+      * 将 `TrainingConfig` 中的 `paligemma_variant` 改回 **`"gemma_2b"`**。
+      * 设置 `pretrained_path` 为真实的 Pi0 `.pt` 权重路径。
 
-### 4.1 冒烟测试 (Sanity Check)
+2.  **修改 `src/wrapper.py` (视分辨率而定)**:
 
-在开始训练前，运行此脚本确保模型架构正确、显存不溢出且 Loss 能够计算。
-*(默认使用 Dummy 模式，不占用大量显存)*
+      * 如果输入图片是 224x224，保持 `n_patches=256` 不变。
+      * 如果输入图片是 336x336，需改为 `n_patches=576`。
 
-```bash
-python debug_model.py
-```
+3.  **启动训练**:
 
-**预期输出**：
-
-> ✅ 成功！同时获得了 Action Loss 和 Recon Loss
-
-### 4.2 启动训练
-
-```bash
-python scripts/train.py
-```
-
------
-
-## 5\. 服务器集成与数据接入指南 (For Integration)
-
-本章节用于指导如何将该框架应用到真实的机器人数据集上。
-
-### 5.1 数据集接入 (Data Loading)
-
-目前的 `src/dataset.py` 使用的是随机生成的假数据。在服务器上训练时，请按以下标准修改 `__getitem__`：
-
-1.  **图像处理**:
-      * 必须包含 OpenPI 默认视角的 Keys: `base_0_rgb`, `left_wrist_0_rgb`, `right_wrist_0_rgb`。
-      * **预处理**: 必须进行 Resize (224x224) 和 Normalize (Mean=0.5, Std=0.5)。
-2.  **文本处理**:
-      * 使用 `AutoTokenizer` (google/paligemma-3b-pt-224)。
-      * 生成 `tokenized_prompt` 和对应的 Masks。
-3.  **维度对齐**:
-      * Action 维度需匹配机器人自由度 (例如 14)。
-
-### 5.2 关键源文件修改点
-
-在迁移到真实任务时，可能需要修改以下文件：
-
-  * **`scripts/train.py`**:
-      * 修改 `TrainingConfig` 类中的 `pretrained_path`，指向真实的 Pi0 `.pt` 权重文件。
-      * 将 `paligemma_variant` 改回 `"gemma_2b"` (目前为了调试默认为 `"dummy"`)。
-  * **`src/wrapper.py`**:
-      * 如果在服务器上使用高分辨率输入 (336x336)，请将 `__init__` 中的 `n_patches` 改为 **576** (224x224 对应 256)。
-  * **`src/pi0_core/pi0_pytorch.py`**:
-      * 如果机器人 Action 维度发生变化 (非 14 或 7)，代码已做动态适配，只需在 Config 中修改 `action_dim` 即可。
-
-### 5.3 显存优化建议
-
-如果在服务器上遇到 OOM (Out of Memory)：
-
-1.  在 `scripts/train.py` 中减小 `batch_size`。
-2.  在 `src/wrapper.py` 中减小 Recon 分支的 `recon_hidden_dim` (默认 1024)。
-3.  确保 `train.py` 中启用了 `gradient_checkpointing`。
-
------
-
-## 6\. 已知问题与维护
-
-  * **Transformers 版本**: 严禁随意升级 `transformers`，否则 `src/pi0_core` 下的补丁将失效，导致 SigLIP 加载失败。
-  * **JAX 依赖**: 虽然是 PyTorch 项目，但为了兼容 OpenPI 的 Config读取逻辑，环境必须安装 `jax` (CPU版即可)。
+    ```bash
+    # 建议使用 tmux 后台运行
+    python scripts/train.py
+    ```
