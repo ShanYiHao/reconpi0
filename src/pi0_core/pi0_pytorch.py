@@ -97,19 +97,19 @@ class PI0Pytorch(nn.Module):
             precision=config.dtype,
         )
 
-        self.action_in_proj = nn.Linear(32, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, 32)
+        self.action_in_proj = nn.Linear(self.config.action_dim, action_expert_config.width)
+        self.action_out_proj = nn.Linear(action_expert_config.width, self.config.action_dim)
 
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
             self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
         else:
-            self.state_proj = nn.Linear(32, action_expert_config.width)
+            self.state_proj = nn.Linear(self.config.action_dim, action_expert_config.width)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        # self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -186,36 +186,32 @@ class PI0Pytorch(nn.Module):
     # -------------------------------------------------------------------------
     # 🔥 修改重点 1: embed_prefix 返回 visual_features
     # -------------------------------------------------------------------------
+# src/pi0_core/pi0_pytorch.py
+
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for PaliGemma transformer processing.
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: # <--- 更新类型提示
+        """Embed images with SigLIP and language tokens..."""
         embs = []
         pad_masks = []
         att_masks = []
         
-        # 新增：用于收集纯视觉特征
+        # 1. 收集视觉特征 (已存在，保持不变)
         raw_visual_features = []
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
-
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
             
-            # 收集特征 (list of [B, N, D])
-            raw_visual_features.append(img_emb)
+            # [关键] 这里保存的是 Vision Encoder 出来的原始特征 [B, N, D]
+            raw_visual_features.append(img_emb) 
 
             bsize, num_img_embs = img_emb.shape[:2]
-
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-
-            # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
 
         # Process language tokens
@@ -225,6 +221,9 @@ class PI0Pytorch(nn.Module):
             return lang_emb * math.sqrt(lang_emb_dim)
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+
+        # [关键] 新增：显式保存文本特征
+        raw_text_features = lang_emb 
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -237,18 +236,20 @@ class PI0Pytorch(nn.Module):
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
-        # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         
-        # 合并视觉特征 [B, Total_Img_Tokens, D]
+        # [关键] 合并视觉特征
+        # 注意：这里将多张图的特征拼接到了一起 [B, Total_Img_Tokens, D]
+        # wrapper.py 会负责把它切分回去
         if raw_visual_features:
             visual_features_tensor = torch.cat(raw_visual_features, dim=1)
         else:
             visual_features_tensor = None
 
-        return embs, pad_masks, att_masks, visual_features_tensor
-
+        # 返回值增加 raw_text_features
+        return embs, pad_masks, att_masks, visual_features_tensor, raw_text_features
+    
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
@@ -331,44 +332,51 @@ class PI0Pytorch(nn.Module):
     # -------------------------------------------------------------------------
     # 🔥 修改重点 2: Forward 返回字典
     # -------------------------------------------------------------------------
+# src/pi0_core/pi0_pytorch.py
+
     def forward(self, observation, actions, noise=None, time=None):
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        """Do a full training forward pass and compute the loss..."""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
+        # ... (中间噪声采样代码保持不变) ...
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
-
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
-
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # 修改解包逻辑：多接收一个 visual_features
-        prefix_embs, prefix_pad_masks, prefix_att_masks, visual_features = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        # [关键修改] 解包 5 个返回值 (增加了 text_features)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, visual_features, text_features = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
         
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        
+        # 类型转换逻辑 (保持不变，但要加上 visual_features 和 text_features 的转换)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-            # 确保视觉特征也是 bf16 (如果需要)
+            target_dtype = torch.bfloat16
+            suffix_embs = suffix_embs.to(dtype=target_dtype)
+            prefix_embs = prefix_embs.to(dtype=target_dtype)
+            
+            # [新增] 确保传给 Recon 的特征也是正确的精度
             if visual_features is not None:
-                visual_features = visual_features.to(dtype=torch.bfloat16)
+                visual_features = visual_features.to(dtype=target_dtype)
+            if text_features is not None:
+                text_features = text_features.to(dtype=target_dtype)
 
+        # ... (中间 Attention Mask 和 Checkpoint 逻辑保持不变) ...
+        
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
@@ -387,7 +395,6 @@ class PI0Pytorch(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        # Apply gradient checkpointing to final action projection if enabled
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
@@ -395,10 +402,11 @@ class PI0Pytorch(nn.Module):
 
         action_loss = F.mse_loss(u_t, v_t, reduction="none")
         
-        # 🟢 返回字典
+        # [关键修改] 返回包含 text_embeds 的字典
         return {
             "loss": action_loss,
-            "visual_features": visual_features
+            "visual_features": visual_features, # [B, Total_Img_Tokens, D]
+            "text_embeds": text_features        # [B, Seq_Len, D]
         }
 
     @torch.no_grad()
@@ -411,8 +419,10 @@ class PI0Pytorch(nn.Module):
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        # 修改解包逻辑：这里我们不需要 visual_features 做推理，用 _ 忽略掉
-        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        # [关键修改] 使用 _ 忽略最后两个返回值 (visual_features, text_features)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _, _ = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
         
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

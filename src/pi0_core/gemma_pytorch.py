@@ -35,8 +35,17 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.text_config.vocab_size = 257152
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
-        vlm_config_hf.vision_config.intermediate_size = 4304
-        vlm_config_hf.vision_config.projection_dim = 2048
+        if vlm_config.width < 128:
+            vlm_config_hf.vision_config.hidden_size = vlm_config.width
+            vlm_config_hf.vision_config.intermediate_size = vlm_config.mlp_dim
+            vlm_config_hf.vision_config.num_hidden_layers = 2
+            vlm_config_hf.vision_config.num_attention_heads = 4
+            vlm_config_hf.vision_config.projection_dim = vlm_config.width # 变成 64
+        else:
+            # 正常模式保持不变
+            vlm_config_hf.vision_config.intermediate_size = 4304
+            vlm_config_hf.vision_config.projection_dim = 2048
+            
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
 

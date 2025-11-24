@@ -1,129 +1,123 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, repeat
 
-# 引入你的两个核心模块
-# 注意：这里假设你在 scripts/train.py 中运行，所以是 src.xxx
+# 引入你的 Recon Denoiser
+# 注意：这里假设类名是 ReconDenoiser，如果之前 grep 确认过是这个那就没问题
 from src.recon_core.denoiser_dit import ReconDenoiser as Denoiser
-# 如果 diffusion_utils 比较复杂，我们也可以在 wrapper 里写一个简单的加噪逻辑，
-# 或者调用 src.recon_core.diffusion_utils.gaussian_diffusion 中的函数
-# 这里为了通用性，我手写了一个简易的加噪函数，你可以替换为 reconVLA 原版的调用
 
 class Pi0ReconWrapper(nn.Module):
     def __init__(
         self, 
         pi0_model, 
-        recon_input_dim=64, # 比如 SigLIP 的输出维度
-        recon_hidden_dim=32, 
-        recon_depth=4
+        recon_input_dim=2048, 
+        recon_hidden_dim=1024, 
+        recon_depth=4,
+        n_patches=256 # 默认 patch 数量
     ):
-        """
-        Args:
-            pi0_model: 已经被加载（甚至已经加上 LoRA）的 Pi0 基础模型
-            recon_input_dim: Pi0 视觉编码器输出的特征维度
-        """
         super().__init__()
         self.policy = pi0_model
         
         # --- Recon 分支 (Denoiser) ---
-        # 这是一个简单的 Transformer 或 MLP，用于根据噪声特征预测原特征
-        # 我们这里实例化你搬运过来的 Denoiser
+        # 初始化参数需与 ReconDenoiser.__init__ 匹配
         self.recon_head = Denoiser(
-            x_channel=recon_input_dim,
-            z_channel=recon_input_dim,
-            embed_dim=recon_hidden_dim,
-            depth=recon_depth,
-            
+            x_channel=recon_input_dim,  # 输入图像特征维度
+            z_channel=recon_input_dim,  # 条件特征维度 (文本)
+            embed_dim=recon_hidden_dim, # 内部隐藏层维度
+            depth=recon_depth,          # 网络深度
+            n_patches=n_patches         # Patch 数量
         )
-        
-        # 如果维度不匹配，加一个投影层
-        self.proj = nn.Identity()
-        # self.proj = nn.Linear(pi0_vision_dim, recon_input_dim) 
 
     def forward(self, images, text, actions=None):
-        """
-        Forward pass logic:
-        1. Pi0 跑一遍 -> 拿到 Action Loss 和 视觉特征 (Features)
-        2. Recon 跑一遍 -> 对 Features 加噪 -> 预测 -> 算 Recon Loss
-        3. 加权求和
-        """
         outputs = {}
         
         # =================================================
         # 1. Pi0 Forward (Action Path)
         # =================================================
-        # 关键点：我们需要 pi0_model 返回的不仅仅是 loss，还有 features
-        # 请确保你修改了 pi0_pytorch.py 的 forward 函数
+        # 这一步会调用 pi0_pytorch.py 的 forward
         policy_out = self.policy(images, text, actions)
         
-        # 兼容性处理：如果 policy_out 是字典
         if isinstance(policy_out, dict):
             action_loss = policy_out.get('loss', 0)
-            # 必须拿到这一层！通常是 Vision Encoder 的输出
             visual_features = policy_out.get('visual_features') 
+            text_embeds = policy_out.get('text_embeds') 
         else:
-            # 如果原模型只返回 loss，这里会报错，必须去改 pi0_pytorch.py
-            raise ValueError("Pi0 model output must be a dict containing 'visual_features'")
+            # 防御性编程：如果 pi0 返回的不是字典
+            raise ValueError(f"Pi0 model output expected dict, got {type(policy_out)}")
 
         outputs['action_loss'] = action_loss
 
         # =================================================
-        # 2. Recon Forward (Auxiliary Task)
+        # 2. Recon Forward (辅助任务)
         # =================================================
-        # 只有训练时才计算 Recon Loss
+        # 只有在训练且成功提取到特征时才计算
         if self.training and visual_features is not None:
-            # a. Detach Features? 
-            # ReconVLA 论文核心：不要 Detach！让 Recon 的梯度回传去优化 Vision Encoder
-            target = visual_features # [B, Seq, Dim]
+            # visual_features shape: [B, Total_Tokens, D]
+            B, N, D = visual_features.shape
             
-            # b. 准备 Timestep (0-999)
-            B = target.shape[0]
-            t = torch.randint(0, 1000, (B,), device=target.device).long()
+            # 计算 Patch 布局
+            # 标准 SigLIP 224x224 -> 16x16 = 256 tokens per image
+            tokens_per_img = 256 
             
-            # c. 加噪 (Add Noise)
-            noise = torch.randn_like(target)
-            noisy_features = self.q_sample(target, t, noise)
+            # 如果 N 不是 256 的倍数 (比如 Dummy 模式下 N 可能很小)
+            # 我们做一个简单的兼容性处理，防止 math.sqrt 报错
+            if N < tokens_per_img:
+                # Dummy 模式兼容: 假设只有一张图，且是正方形
+                tokens_per_img = N
+                num_cams = 1
+            else:
+                num_cams = N // tokens_per_img
             
-            # d. 去噪 (Denoise Prediction)
-            # 传入 noisy_features 和 timestep。
-            # 有些 Denoiser 还需要 text embedding 做 condition，视你的 denoiser_vit 实现而定
-            text_embeds = policy_out.get('text_embeds')
-            pred_noise = self.recon_head(noisy_features, t, context=text_embeds)
+            side = int(math.sqrt(tokens_per_img))
             
-            # e. 计算 Loss (MSE)
-            # 预测噪声 vs 真实噪声
-            recon_loss = F.mse_loss(pred_noise, noise)
-            outputs['recon_loss'] = recon_loss
+            # 步骤 A: 维度重排
+            # 将 [B, num_cams * H * W, D] -> [B * num_cams, D, H, W]
+            # 我们把每个摄像头视角视为独立的样本进行重建
+            spatial_features = rearrange(
+                visual_features, 
+                'b (k h w) c -> (b k) c h w', 
+                k=num_cams, 
+                h=side, 
+                w=side
+            )
             
-            # f. 合并 Loss (Total Loss)
-            # 0.5 是 Recon 的权重，可调
-            outputs['loss'] = action_loss + 0.5 * recon_loss
+# 步骤 B: 对齐文本条件
+            if text_embeds is not None:
+                # 1. [关键修复] 文本池化: [B, SeqLen, D] -> [B, D]
+                # 我们取文本序列的平均值，得到一个全局的文本语义向量
+                pooled_text = text_embeds.mean(dim=1) 
+                
+                # 2. 复制以匹配多视角: [B, D] -> [B*K, D]
+                text_cond = repeat(pooled_text, 'b d -> (b k) d', k=num_cams)
+                
+                # 3. 伪装成 1x1 的图片传入 DiT: [B*K, D] -> [B*K, D, 1, 1]
+                # 这样 DiT 内部展开后长度为 1，可以广播给任意长度的图像特征 (256)
+                text_cond = rearrange(text_cond, 'b d -> b d 1 1')
+            else:
+                text_cond = None
+
+            # 步骤 C: 调用 Denoiser
+            recon_loss = self.recon_head(z=text_cond, target=spatial_features)
+            
+            if isinstance(recon_loss, dict):
+                recon_loss = recon_loss['loss']
+            
+            # [关键修复] 1. 算出标量
+            recon_loss_scalar = recon_loss.mean()
+            action_loss_scalar = action_loss.mean()
+            
+            # [关键修复] 2. 更新 outputs 里的值为标量 (方便打印和日志)
+            outputs['recon_loss'] = recon_loss_scalar
+            outputs['action_loss'] = action_loss_scalar  # <--- 新增这行，覆盖原来的大 Tensor
+            
+            # 3. 合并 Loss
+            outputs['loss'] = action_loss_scalar + 0.5 * recon_loss_scalar
+            
         else:
-            outputs['loss'] = action_loss
+            # [关键修复] 验证模式也要转标量
+            outputs['action_loss'] = action_loss.mean() # <--- 新增这行
+            outputs['loss'] = outputs['action_loss']
 
         return outputs
-
-    def q_sample(self, x_start, t, noise=None):
-        """
-        简易的 Diffusion 加噪过程 (Linear Schedule)
-        x_t = sqrt(alpha_bar) * x_0 + sqrt(1 - alpha_bar) * noise
-        """
-        if noise is None:
-            noise = torch.randn_like(x_start)
-            
-        # 简单的线性 beta schedule，实际可以用 src/recon_core/diffusion_utils 里的
-        beta_min, beta_max = 0.0001, 0.02
-        betas = torch.linspace(beta_min, beta_max, 1000, device=x_start.device)
-        alphas = 1. - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        
-        # 提取当前 t 的系数
-        sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod[t])
-        sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod[t])
-        
-        # 广播维度 [B] -> [B, 1, 1] 以匹配特征
-        while len(sqrt_alphas_cumprod.shape) < len(x_start.shape):
-            sqrt_alphas_cumprod = sqrt_alphas_cumprod.unsqueeze(-1)
-            sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.unsqueeze(-1)
-            
-        return sqrt_alphas_cumprod * x_start + sqrt_one_minus_alphas_cumprod * noise
