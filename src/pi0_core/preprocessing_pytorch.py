@@ -3,7 +3,7 @@ import logging
 
 import torch
 
-from openpi.shared import image_tools
+from . import image_tools
 
 logger = logging.getLogger("openpi")
 

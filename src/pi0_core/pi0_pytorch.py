@@ -6,9 +6,9 @@ from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
-import openpi.models.gemma as _gemma
-from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
-import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from . import gemma as _gemma 
+from .gemma_pytorch import PaliGemmaWithExpertModel
+from . import preprocessing_pytorch as _preprocessing
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -183,15 +183,21 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
+    # -------------------------------------------------------------------------
+    # 🔥 修改重点 1: embed_prefix 返回 visual_features
+    # -------------------------------------------------------------------------
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
         """
         embs = []
         pad_masks = []
         att_masks = []
+        
+        # 新增：用于收集纯视觉特征
+        raw_visual_features = []
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -200,6 +206,9 @@ class PI0Pytorch(nn.Module):
                 return self.paligemma_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
+            
+            # 收集特征 (list of [B, N, D])
+            raw_visual_features.append(img_emb)
 
             bsize, num_img_embs = img_emb.shape[:2]
 
@@ -231,8 +240,14 @@ class PI0Pytorch(nn.Module):
         # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        
+        # 合并视觉特征 [B, Total_Img_Tokens, D]
+        if raw_visual_features:
+            visual_features_tensor = torch.cat(raw_visual_features, dim=1)
+        else:
+            visual_features_tensor = None
 
-        return embs, pad_masks, att_masks
+        return embs, pad_masks, att_masks, visual_features_tensor
 
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -313,7 +328,10 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
+    # -------------------------------------------------------------------------
+    # 🔥 修改重点 2: Forward 返回字典
+    # -------------------------------------------------------------------------
+    def forward(self, observation, actions, noise=None, time=None):
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
@@ -327,7 +345,9 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        # 修改解包逻辑：多接收一个 visual_features
+        prefix_embs, prefix_pad_masks, prefix_att_masks, visual_features = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -335,6 +355,9 @@ class PI0Pytorch(nn.Module):
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+            # 确保视觉特征也是 bf16 (如果需要)
+            if visual_features is not None:
+                visual_features = visual_features.to(dtype=torch.bfloat16)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -370,7 +393,13 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        action_loss = F.mse_loss(u_t, v_t, reduction="none")
+        
+        # 🟢 返回字典
+        return {
+            "loss": action_loss,
+            "visual_features": visual_features
+        }
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
@@ -382,7 +411,9 @@ class PI0Pytorch(nn.Module):
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        # 修改解包逻辑：这里我们不需要 visual_features 做推理，用 _ 忽略掉
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -418,6 +449,7 @@ class PI0Pytorch(nn.Module):
             time += dt
         return x_t
 
+    # ... denoise_step 保持不变 ...
     def denoise_step(
         self,
         state,

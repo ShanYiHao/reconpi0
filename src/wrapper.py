@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 # 引入你的两个核心模块
 # 注意：这里假设你在 scripts/train.py 中运行，所以是 src.xxx
-from src.recon_core.denoiser_vit import Denoiser
+from src.recon_core.denoiser_dit import ReconDenoiser as Denoiser
 # 如果 diffusion_utils 比较复杂，我们也可以在 wrapper 里写一个简单的加噪逻辑，
 # 或者调用 src.recon_core.diffusion_utils.gaussian_diffusion 中的函数
 # 这里为了通用性，我手写了一个简易的加噪函数，你可以替换为 reconVLA 原版的调用
@@ -13,8 +13,8 @@ class Pi0ReconWrapper(nn.Module):
     def __init__(
         self, 
         pi0_model, 
-        recon_input_dim=2048, # 比如 SigLIP 的输出维度
-        recon_hidden_dim=1024, 
+        recon_input_dim=64, # 比如 SigLIP 的输出维度
+        recon_hidden_dim=32, 
         recon_depth=4
     ):
         """
@@ -29,10 +29,11 @@ class Pi0ReconWrapper(nn.Module):
         # 这是一个简单的 Transformer 或 MLP，用于根据噪声特征预测原特征
         # 我们这里实例化你搬运过来的 Denoiser
         self.recon_head = Denoiser(
-            input_dim=recon_input_dim,
-            hidden_dim=recon_hidden_dim,
+            x_channel=recon_input_dim,
+            z_channel=recon_input_dim,
+            embed_dim=recon_hidden_dim,
             depth=recon_depth,
-            num_heads=8
+            
         )
         
         # 如果维度不匹配，加一个投影层
@@ -86,7 +87,8 @@ class Pi0ReconWrapper(nn.Module):
             # d. 去噪 (Denoise Prediction)
             # 传入 noisy_features 和 timestep。
             # 有些 Denoiser 还需要 text embedding 做 condition，视你的 denoiser_vit 实现而定
-            pred_noise = self.recon_head(noisy_features, t)
+            text_embeds = policy_out.get('text_embeds')
+            pred_noise = self.recon_head(noisy_features, t, context=text_embeds)
             
             # e. 计算 Loss (MSE)
             # 预测噪声 vs 真实噪声
